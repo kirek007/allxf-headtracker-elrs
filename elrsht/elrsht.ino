@@ -36,6 +36,14 @@ uint8_t uid[6];
 ppmReader ppmRx;
 int* ppmArray;
 
+// diag counters
+volatile uint32_t diag_sendOk, diag_sendFail;
+uint32_t diag_uartBytes, diag_htFrames, diag_ppmFrames, diag_lastPrint;
+
+void onEspNowSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  if (status == ESP_NOW_SEND_SUCCESS) diag_sendOk++; else diag_sendFail++;
+}
+
 // -------- TX functions --------
 void sendMspEspNow(uint16_t function, const uint8_t *data, uint16_t len) {
     uint8_t frame[64];
@@ -43,13 +51,23 @@ void sendMspEspNow(uint16_t function, const uint8_t *data, uint16_t len) {
     if (frameLen) esp_now_send(uid, frame, frameLen);
 }
 
+// ELRS treats PTR payload as raw 11-bit CRSF values (same scale the HDZero backpack sends)
+#define CRSF_1000  191
+#define CRSF_MID   992
+#define CRSF_2000  1792
+
+// +-180 deg (+-2048) -> CRSF 1000..2000, centred on 992
+int16_t allxfAngleToCrsf(int32_t raw) {
+    return constrain(CRSF_MID + raw * (CRSF_2000 - CRSF_1000) / 4096, CRSF_1000, CRSF_2000);
+}
+
 void sendAllxfHtPacket() {
     int16_t channels[5];
-    channels[0] = constrain((allxf_htMsg.pan+2048)/2, 0, 2000);
-    channels[1] = constrain((allxf_htMsg.tilt+2048)/2, 0, 2000);
-    channels[2] = constrain((allxf_htMsg.roll+2048)/2, 0, 2000);
-    channels[3] = map(allxf_htMsg.mode, 0, 2, 0, 2000);
-    channels[4] = map(allxf_htMsg.sensitivity, -15, 15, 100, 1900);
+    channels[0] = allxfAngleToCrsf(allxf_htMsg.pan);
+    channels[1] = allxfAngleToCrsf(allxf_htMsg.tilt);
+    channels[2] = allxfAngleToCrsf(allxf_htMsg.roll);
+    channels[3] = map(allxf_htMsg.mode, 0, 2, CRSF_1000, CRSF_2000);
+    channels[4] = map(allxf_htMsg.sensitivity, -15, 15, CRSF_1000, CRSF_2000);
     sendMspEspNow(MSP_ELRS_SET_PTR, (uint8_t*) channels, sizeof(channels));
 }
 
@@ -58,7 +76,7 @@ void sendPpmHtPacket() {
     int16_t channels[channelCount];
 
     for(uint8_t i = 0; i < channelCount; i++)
-      channels[i] = constrain((ppmArray[i+1]-1000)*2, 0, 2000);
+      channels[i] = constrain(map(ppmArray[i+1], 1000, 2000, CRSF_1000, CRSF_2000), CRSF_1000, CRSF_2000);
 
     sendMspEspNow(MSP_ELRS_SET_PTR, (uint8_t*) channels, sizeof(channels));
     Serial.printf("ppm chans: %d\t", channelCount);
@@ -88,6 +106,7 @@ void generateUID(const char *phrase, uint8_t *out) {
 bool processAllxfHt(void) {
   if(Serial1.available()) {
     uint8_t data = Serial1.read();
+    diag_uartBytes++;
 
     if(allxf_htState == STATE_RECEIVING) {
       allxf_rxBuf[allxf_rxCount++] = data;
@@ -114,6 +133,7 @@ bool processAllxfHt(void) {
 
 void setup() {
   Serial.begin(115200);
+  while(!Serial && millis() < 3000);
 
   // Setup HT UART
   pinMode(RX_PIN, INPUT_PULLUP);
@@ -130,8 +150,13 @@ void setup() {
   esp_wifi_set_mac(WIFI_IF_STA, uid);
 
   // Set channel to 1 (hardcoded in all Backpack modules)
-  WiFi.begin("", "", 1);
-  WiFi.disconnect();
+  // WiFi.begin("", "", 1) is a no-op on core 3.x (empty SSID is rejected), so set it directly
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  uint8_t ch; wifi_second_chan_t ch2;
+  esp_wifi_get_channel(&ch, &ch2);
+  Serial.printf("\nelrsht boot, phrase \"%s\"\nuid/mac %02X:%02X:%02X:%02X:%02X:%02X  sta mac %s  wifi ch %d\n",
+    BINDING_PHRASE, uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], WiFi.macAddress().c_str(), ch);
 
   // Set up ESP-NOW
   if (esp_now_init() != 0) {
@@ -144,6 +169,7 @@ void setup() {
   peer.encrypt = false;
   if (esp_now_add_peer(&peer) != ESP_OK)
       Serial.print("ESP-NOW add peer failed\n");
+  esp_now_register_send_cb(onEspNowSent);
 
   // Start PPM receiver
   pinMode(PPM_PIN, INPUT_PULLUP);
@@ -154,12 +180,22 @@ void setup() {
 void loop() {
   // Read HT
   if(processAllxfHt()) {
+    diag_htFrames++;
     sendAllxfHtPacket();
     digitalWrite(LED, !digitalRead(LED));
   }
   if(ppmRx.newFrame()) {
+    diag_ppmFrames++;
     sendPpmHtPacket();
     digitalWrite(LED, !digitalRead(LED));
+  }
+
+  // diag: uart bytes/frames from HT, and esp-now delivery (ok = backpack with our uid ACKed)
+  if(millis() - diag_lastPrint >= 1000) {
+    diag_lastPrint = millis();
+    Serial.printf("[diag] uart bytes %lu  ht frames %lu  ppm frames %lu  espnow ok %lu fail %lu  crsf pan %d tilt %d roll %d\n",
+      diag_uartBytes, diag_htFrames, diag_ppmFrames, diag_sendOk, diag_sendFail,
+      allxfAngleToCrsf(allxf_htMsg.pan), allxfAngleToCrsf(allxf_htMsg.tilt), allxfAngleToCrsf(allxf_htMsg.roll));
   }
 }
 
